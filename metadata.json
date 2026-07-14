@@ -1,0 +1,6 @@
+{
+  "name": "WhatsApp Automation Dashboard",
+  "description": "A responsive full-stack real-time control panel to schedule and monitor bulk message queues with randomized anti-ban delays, interactive cool-downs, and simulated device linking.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
