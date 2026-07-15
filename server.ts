@@ -31,11 +31,20 @@ let campaignStatus: "idle" | "sending" | "cooldown" | "stopped" | "completed" = 
 let queue: QueueItem[] = [];
 let logs: LogEntry[] = [];
 let sentCount = 0;
+let failedCount = 0;
 let totalCount = 0;
 
 let activeTimeout: NodeJS.Timeout | null = null;
 let activeInterval: NodeJS.Timeout | null = null;
 let delayCountdownInterval: NodeJS.Timeout | null = null;
+
+let campaignConfig = {
+  delayType: "human",
+  customDelayValue: 3,
+  enableCooldown: true,
+  cooldownLimit: 50,
+  cooldownDuration: 60
+};
 
 async function startServer() {
   const app = express();
@@ -67,14 +76,26 @@ async function startServer() {
     io.emit("log_added", entry);
   }
 
-  // Helper to broadcast current full state to clients
+  // Get sliced queue for extremely fast payload delivery over websockets (avoids tab crashes)
+  function getSlicedQueue() {
+    const activeIndex = queue.findIndex(item => item.status === "sending" || item.status === "pending");
+    if (queue.length > 200) {
+      const start = Math.max(0, (activeIndex !== -1 ? activeIndex : 0) - 50);
+      const end = Math.min(queue.length, start + 200);
+      return queue.slice(start, end);
+    }
+    return queue;
+  }
+
+  // Helper to broadcast current full state to clients (capped to prevent bandwidth/tab freezes)
   function broadcastState() {
     io.emit("state_changed", {
       sessionLinked,
       sessionStatus,
       campaignStatus,
-      queue,
+      queue: getSlicedQueue(),
       sentCount,
+      failedCount,
       totalCount,
     });
   }
@@ -185,9 +206,10 @@ async function startServer() {
       sessionLinked,
       sessionStatus,
       campaignStatus,
-      queue,
+      queue: getSlicedQueue(),
       logs,
       sentCount,
+      failedCount,
       totalCount,
     });
 
@@ -252,7 +274,15 @@ async function startServer() {
     });
 
     // Handle campaign starting
-    socket.on("start_campaign", (data: { numbers: string[]; message: string }) => {
+    socket.on("start_campaign", (data: { 
+      numbers: string[]; 
+      message: string;
+      delayType?: "instant" | "fast" | "normal" | "human" | "custom";
+      customDelayValue?: number;
+      enableCooldown?: boolean;
+      cooldownLimit?: number;
+      cooldownDuration?: number;
+    }) => {
       if (!sessionLinked) {
         addLog("error", "Cannot start campaign: No authenticated WhatsApp session.");
         return;
@@ -262,15 +292,34 @@ async function startServer() {
         return;
       }
 
-      const { numbers, message } = data;
+      const { 
+        numbers, 
+        message,
+        delayType = "human",
+        customDelayValue = 3,
+        enableCooldown = true,
+        cooldownLimit = 50,
+        cooldownDuration = 60
+      } = data;
+
       if (!numbers || numbers.length === 0 || !message) {
         addLog("error", "Validation failed: Phone numbers and message template are required.");
         return;
       }
 
+      // Update active configs
+      campaignConfig = {
+        delayType,
+        customDelayValue,
+        enableCooldown,
+        cooldownLimit,
+        cooldownDuration
+      };
+
       // Initialize Campaign Queue
       campaignStatus = "sending";
       sentCount = 0;
+      failedCount = 0;
       totalCount = numbers.length;
       queue = numbers.map((num, idx) => ({
         id: idx + 1,
@@ -279,7 +328,7 @@ async function startServer() {
         status: "pending" as const,
       }));
 
-      addLog("info", `Starting campaign to send messages to ${totalCount} targets...`);
+      addLog("info", `Starting campaign for ${totalCount} targets (Delay: ${delayType}, Cooldown: ${enableCooldown ? 'On' : 'Off'})...`);
       broadcastState();
 
       // Begin sending loop
@@ -307,6 +356,7 @@ async function startServer() {
       }
       queue = [];
       sentCount = 0;
+      failedCount = 0;
       totalCount = 0;
       campaignStatus = "idle";
       addLog("info", "Campaign queue and stats cleared.");
@@ -326,13 +376,14 @@ async function startServer() {
       return;
     }
 
-    // Safety cool-down check: 1-minute period after every 50 sent messages
-    if (sentCount > 0 && sentCount % 50 === 0 && campaignStatus !== "cooldown") {
+    // Safety cool-down check
+    if (campaignConfig.enableCooldown && sentCount > 0 && sentCount % campaignConfig.cooldownLimit === 0 && campaignStatus !== "cooldown") {
       campaignStatus = "cooldown";
-      addLog("warning", `⚠️ Anti-Ban Safety Triggered: Cool-down active for 60 seconds after sending ${sentCount} messages.`);
+      const duration = campaignConfig.cooldownDuration;
+      addLog("warning", `⚠️ Anti-Ban Safety Triggered: Cool-down active for ${duration} seconds after sending ${sentCount} messages.`);
       broadcastState();
 
-      let secondsLeft = 60;
+      let secondsLeft = duration;
       io.emit("cooldown_tick", secondsLeft);
 
       activeInterval = setInterval(() => {
@@ -354,26 +405,43 @@ async function startServer() {
     nextItem.status = "sending";
     broadcastState();
 
-    // Determine randomized 'human-like' delay (between 3,000ms and 8,000ms)
-    const delay = Math.floor(Math.random() * (8000 - 3000 + 1)) + 3000;
+    // Determine randomized 'human-like' or custom delay
+    let delay = 3000;
+    if (campaignConfig.delayType === "instant") {
+      delay = 80; // minimal non-zero delay to avoid process blockage and keep socket events fluid
+    } else if (campaignConfig.delayType === "fast") {
+      delay = 500;
+    } else if (campaignConfig.delayType === "normal") {
+      delay = 2000;
+    } else if (campaignConfig.delayType === "custom") {
+      delay = (campaignConfig.customDelayValue || 3) * 1000;
+    } else { // human (random 3-8s)
+      delay = Math.floor(Math.random() * (8000 - 3000 + 1)) + 3000;
+    }
+
     addLog("info", `Preparing to transmit next message to ${nextItem.phone}...`);
     
     // Notify clients of the active delay countdown
     let delayRemaining = Math.round(delay / 1000);
-    io.emit("delay_tick", { phone: nextItem.phone, seconds: delayRemaining });
+    if (delayRemaining > 0) {
+      io.emit("delay_tick", { phone: nextItem.phone, seconds: delayRemaining });
 
-    delayCountdownInterval = setInterval(() => {
-      delayRemaining--;
-      if (delayRemaining >= 0) {
-        io.emit("delay_tick", { phone: nextItem.phone, seconds: delayRemaining });
-      }
-    }, 1000);
+      delayCountdownInterval = setInterval(() => {
+        delayRemaining--;
+        if (delayRemaining >= 0) {
+          io.emit("delay_tick", { phone: nextItem.phone, seconds: delayRemaining });
+        }
+      }, 1000);
+    } else {
+      io.emit("delay_tick", { phone: nextItem.phone, seconds: 0 });
+    }
 
     activeTimeout = setTimeout(async () => {
       if (delayCountdownInterval) clearInterval(delayCountdownInterval);
 
       if (!sessionLinked || !sock) {
         nextItem.status = "failed";
+        failedCount++;
         addLog("error", `[Failed] WhatsApp session lost. Cannot send message to ${nextItem.phone}.`);
         broadcastState();
         return;
@@ -396,6 +464,7 @@ async function startServer() {
         addLog("success", `[Sent] Message #${nextItem.id} delivered successfully to ${nextItem.phone}.`);
       } catch (err: any) {
         nextItem.status = "failed";
+        failedCount++;
         addLog("error", `[Failed] Error sending to ${nextItem.phone}: ${err.message || err}`);
       }
 
